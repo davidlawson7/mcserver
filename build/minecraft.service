@@ -1,0 +1,22 @@
+[Unit]
+Description=Minecraft Server
+After=network.target
+
+[Service]
+User=minecraft
+Nice=5
+KillMode=none
+SuccessExitStatus=0 1
+InaccessibleDirectories=/root /sys /srv /media -/lost+found
+NoNewPrivileges=true
+WorkingDirectory=/opt/minecraft/server
+ReadWriteDirectories=/opt/minecraft/server
+ExecStart=/usr/bin/java -Xmx3072M -Xms3072M -jar server.jar nogui
+
+# Restart the server when it is stopped or crashed after 30 seconds
+# Comment out RestartSec if you want to restart immediately
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target
