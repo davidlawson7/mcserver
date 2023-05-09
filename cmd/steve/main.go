@@ -7,11 +7,13 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"sync"
 
 	"time"
 
 	"github.com/bwmarrin/discordgo"
 	"github.com/davidlawson7/steve-gobot/pkg/bot"
+	"github.com/davidlawson7/steve-gobot/pkg/constants"
 	"github.com/dreamscached/minequery/v2"
 )
 
@@ -47,9 +49,11 @@ func init() {
 }
 
 var (
-	integerOptionMinValue = 1.0
-	CurrentIP             string
-	Token                 string
+	CurrentIP     string = ""
+	Reachable     bool   = false
+	Token         string
+	Shutdown      bool = true
+	ShutdownMutex sync.Mutex
 
 	commands = []*discordgo.ApplicationCommand{
 		{
@@ -68,6 +72,17 @@ var (
 
 	commandHandlers = map[string]func(s *discordgo.Session, i *discordgo.InteractionCreate){
 		"start": func(s *discordgo.Session, i *discordgo.InteractionCreate) {
+			// Server started and reachable, no reason to hit lambda
+			if CurrentIP != "" && Reachable {
+				s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+					Type: discordgo.InteractionResponseChannelMessageWithSource,
+					Data: &discordgo.InteractionResponseData{
+						Content: fmt.Sprintf("Minecraft server already started. IP: %s", CurrentIP),
+					},
+				})
+				return
+			}
+
 			// Send response immediately and handle the starting logic later.
 			s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 				Type: discordgo.InteractionResponseDeferredChannelMessageWithSource,
@@ -85,14 +100,16 @@ var (
 				os.Exit(1)
 			}
 
-			_, body, err := bot.ParseLambda(res.Payload)
+			_, _, err = bot.ParseLambda(res.Payload)
 			if err != nil {
 				// Handle better
 				fmt.Println(err)
 				os.Exit(1)
 			}
 
-			fmt.Println("Initial Start Response: ", body.Message)
+			ShutdownMutex.Lock()
+			Shutdown = false
+			ShutdownMutex.Unlock()
 
 			go func() {
 				counter := 0
@@ -112,19 +129,79 @@ var (
 						os.Exit(1)
 					}
 
-					fmt.Println("Check Response: ", body.Message)
-
 					if body.Message == "running" {
+						if _, err := minequery.Ping17(body.IPAddress, 25565); err == nil {
+							// Only if the EC2 is running AND MC server started and reachable do we proceed with ending this loop
+							Reachable = true
+						}
+					}
+
+					if body.Message == "running" && Reachable {
 						CurrentIP = body.IPAddress // Set CURRENT IP address
-						message := fmt.Sprintf("Started Minecraft, IP: %s\n", body.IPAddress)
+						message := fmt.Sprintf("Started Minecraft, IP: %s\n", CurrentIP)
 						s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
 							Content: &message,
 						})
+
+						// Create a scheduled job to check the server if empty after 10 minutes, and then shutdown
+						go func() {
+							// Initial sleep to prevent spamming the server as soon as its ready
+							time.Sleep(constants.TIME_5_MIN)
+							mark := false
+
+							for {
+								mping, err := minequery.Ping17(CurrentIP, 25565)
+								if err != nil {
+									// Cannot reach server, it must be down
+									fmt.Println("mcserver not reachable during normal ping, must be down.")
+									s.ChannelMessageSend(i.ChannelID, "mcserver not reachable during normal ping, must be down... Help sir.")
+									break
+								}
+								isEmpty := len(mping.SamplePlayers) == 0
+
+								// triggered a countdown to turn server off, but players jumped back on
+								if mark && !isEmpty {
+									mark = false
+								}
+
+								// SHUTDOWN SERVER
+								if mark && isEmpty {
+									ShutdownMutex.Lock()
+									if Shutdown {
+										fmt.Println("already shutdown manually, this thread can just die silently")
+										break // If shutdown already, just exit the loop and end thread
+									}
+									ShutdownMutex.Unlock()
+
+									fmt.Println("Max time reached without players in server, shut it down.")
+									if _, err := bot.InvokeLambda(&ctx, "stop"); err != nil {
+										s.ChannelMessageSend(i.ChannelID, "Server left unattended for over 10 minutes BUT unable to auto shutdown... Help sir.")
+									} else {
+										s.ChannelMessageSend(i.ChannelID, "Server left unattended for over 10 minutes, shutting down...")
+										// Reset control vars
+										Reachable = false
+										CurrentIP = ""
+									}
+
+									break
+								}
+
+								if isEmpty {
+									mark = true
+								}
+
+								// Normal check interval, sleep for 10 minutes between doing work
+								time.Sleep(constants.TIME_10_MIN)
+							}
+
+							// If we get here, thread should end
+						}()
+
 						// Server started! Send the response back to server
 						return
 					}
 					counter++
-					time.Sleep(time.Duration(10) * time.Second)
+					time.Sleep(constants.TIME_10_SEC)
 				}
 
 				// Couldnt start the server, send a update response to the channel
@@ -154,14 +231,16 @@ var (
 				os.Exit(1)
 			}
 
-			_, body, err := bot.ParseLambda(res.Payload)
+			_, _, err = bot.ParseLambda(res.Payload)
 			if err != nil {
 				// Handle better
 				fmt.Println(err)
 				os.Exit(1)
 			}
 
-			fmt.Println("Initial Stop Response: ", body.Message)
+			ShutdownMutex.Lock()
+			Shutdown = true
+			ShutdownMutex.Unlock()
 
 			go func() {
 				counter := 0
@@ -181,11 +260,10 @@ var (
 						os.Exit(1)
 					}
 
-					fmt.Println("Check Response: ", body.Message)
-
 					if body.Message == "stopped" {
-						CurrentIP = "" // Unset CURRENT IP address
-						message := fmt.Sprintf("Stopped Minecraft\n")
+						CurrentIP = ""    // Unset CURRENT IP address
+						Reachable = false // Set status to unreachable
+						message := "Stopped Minecraft"
 						s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
 							Content: &message,
 						})
@@ -206,14 +284,47 @@ var (
 			}() // Note the parentheses. We must call the anonymous function.
 		},
 		"status": func(s *discordgo.Session, i *discordgo.InteractionCreate) {
+			if CurrentIP == "" {
+				// EC2 is not running, or atleast was started outside this apps flow
+				s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+					Type: discordgo.InteractionResponseChannelMessageWithSource,
+					Data: &discordgo.InteractionResponseData{
+						Content: "Server is off.",
+					},
+				})
+				// Exit early
+				return
+			}
 
-			fmt.Println("Do work status here")
-
+			// Send message to indicate PING is happening.
 			s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
-				Type: discordgo.InteractionResponseChannelMessageWithSource,
+				Type: discordgo.InteractionResponseDeferredChannelMessageWithSource,
 				Data: &discordgo.InteractionResponseData{
-					Content: "Status!",
+					Content: "Awaiting ping response...",
 				},
+			})
+
+			res, err := minequery.Ping17(CurrentIP, 25565)
+
+			if err != nil {
+				errorContent := "Server is on but Minecraft is not yet reachable."
+				s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
+					Content: &errorContent,
+				})
+				return
+			}
+
+			var players = ""
+			for _, p := range res.SamplePlayers {
+				if players == "" {
+					players = p.Nickname
+					continue
+				}
+				players = fmt.Sprintf("%s, %s", players, p.Nickname)
+			}
+			resContent := fmt.Sprintf("Minecraft Server %s, protocol version %d\ndescription: %s\n%d/%d players online\nplayers: %s\n", res.VersionName, res.ProtocolVersion, bot.NaturalizeMOTD(res.Description.String()), res.OnlinePlayers, res.MaxPlayers, players)
+			s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
+				Content: &resContent,
 			})
 		},
 	}
@@ -228,11 +339,8 @@ func init() {
 }
 
 func main() {
-	s.AddHandler(messageCreate)
-	// Register the messageCreate func as a callback for MessageCreate events.
-
 	// In this example, we only care about receiving message events.
-	s.Identify.Intents = discordgo.IntentsGuildMessages
+	s.Identify.Intents = discordgo.IntentsGuildMessages | discordgo.IntentGuildPresences
 
 	// Open a websocket connection to Discord and begin listening.
 	err := s.Open()
@@ -263,15 +371,6 @@ func main() {
 	<-stop
 
 	log.Println("Removing commands...")
-	// // We need to fetch the commands, since deleting requires the command ID.
-	// // We are doing this from the returned commands on line 375, because using
-	// // this will delete all the commands, which might not be desirable, so we
-	// // are deleting only the commands that we added.
-	// registeredCommands, err := s.ApplicationCommands(s.State.User.ID, *GuildID)
-	// if err != nil {
-	// 	log.Fatalf("Could not fetch registered commands: %v", err)
-	// }
-
 	for _, v := range registeredCommands {
 		err := s.ApplicationCommandDelete(s.State.User.ID, "", v.ID)
 		if err != nil {
@@ -280,32 +379,4 @@ func main() {
 	}
 
 	log.Println("Gracefully shutting down.")
-}
-
-// This function will be called (due to AddHandler above) every time a new
-// message is created on any channel that the authenticated bot has access to.
-func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
-
-	// Ignore all messages created by the bot itself
-	// This isn't required in this specific example but it's a good practice.
-	if m.Author.ID == s.State.User.ID {
-		return
-	}
-
-	if m.Content == "mcserver status" {
-
-		if CurrentIP == "" {
-			s.ChannelMessageSend(m.ChannelID, "Server is currently offline")
-			return
-		}
-
-		res, err := minequery.Ping17(CurrentIP, 25565)
-
-		if err != nil {
-			s.ChannelMessageSend(m.ChannelID, "Failed to ping server")
-			return
-		}
-		fmt.Println(res)
-		s.ChannelMessageSend(m.ChannelID, res.String())
-	}
 }

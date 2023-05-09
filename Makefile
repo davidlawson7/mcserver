@@ -13,3 +13,7 @@ deploy-mcss: zip-mcss
 # Minecraft BOT Steve helpers
 steve:
 	go run cmd/steve/main.go -t $(BOT_TOKEN)
+
+# Build Steve
+compile-steve:
+	GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o bin/steve-linux-arm64/main cmd/steve/main.go

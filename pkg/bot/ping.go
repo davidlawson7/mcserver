@@ -3,6 +3,8 @@ package bot
 import (
 	"encoding/json"
 	"fmt"
+	"regexp"
+	"strings"
 )
 
 type Response struct {
@@ -32,4 +34,11 @@ func ParseLambda(data []byte) (*Response, *MCStartResponseBody, error) {
 	}
 
 	return &payload, &body, nil
+}
+
+func NaturalizeMOTD(s string) string {
+	s = strings.ReplaceAll(s, "\n", " ")
+	s = regexp.MustCompile("\u00a7[a-f0-9k-or]").ReplaceAllString(s, "")
+	s = strings.TrimSpace(s)
+	return s
 }
